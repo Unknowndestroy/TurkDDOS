@@ -1,4 +1,2 @@
-Kodun çalışması için bu kodları cmdye yazın
-
 pip install scapy
 pip install django
