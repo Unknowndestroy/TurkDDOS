@@ -12,7 +12,7 @@ DDOS system, that modified version of HULK, added more bots.
 - IP Attack Support
 - Methods
 - Modules
-- Terminal / RC Open Detection
+- Terminal / RC Open / Termux / OS Detection
 - Multiple Methods at Once
 - Expanded License
-# TERMUX SUPPORTED 
+## TERMUX SUPPORTED 
