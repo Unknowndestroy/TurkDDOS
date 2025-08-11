@@ -1,7 +1,8 @@
 # TurkDDOS
-DDOS system, that modified version of HULK, added more bots.
+DDoS / DoS system, that modified version of HULK.
 ## Coming Soon
 - Better GUI
+- DDoS / DoS switch
 - More Bot Support
 - IRC Server Support
 - Local Server
