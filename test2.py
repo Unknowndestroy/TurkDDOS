@@ -22,7 +22,13 @@ import select
 import re
 
 IS_TERMUX = 'com.termux' in os.environ.get('PREFIX', '')
-IS_ROOT = os.geteuid() == 0 if os.name == 'posix' else ctypes.windll.shell32.IsUserAnAdmin() != 0 if os.name == 'nt' else False
+IS_ROOT = False
+if os.name == 'posix':
+    IS_ROOT = os.geteuid() == 0
+elif os.name == 'nt':
+    import ctypes
+    IS_ROOT = ctypes.windll.shell32.IsUserAnAdmin() != 0
+
 DEBUG_MODE = False
 
 class PyNetStressTerminal:
@@ -48,7 +54,17 @@ class PyNetStressTerminal:
         self.cpu_usage = 0
         self.memory_usage = 0
         self.network_usage = 0
-        self.start_network_stats = psutil.net_io_counters()
+        
+        # Handle Termux restrictions for network stats
+        if not IS_TERMUX:
+            try:
+                self.start_network_stats = psutil.net_io_counters()
+            except (PermissionError, FileNotFoundError):
+                print("[WARNING] Cannot access network statistics on this system")
+                self.start_network_stats = None
+        else:
+            self.start_network_stats = None
+            
         self.check_dependencies()
         
     def debug_log(self, message):
@@ -119,7 +135,14 @@ class PyNetStressTerminal:
             "success_rate": 0,
             "target_status": "Unknown"
         }
-        self.start_network_stats = psutil.net_io_counters()
+        
+        # Only reset network stats if we can access them
+        if not IS_TERMUX:
+            try:
+                self.start_network_stats = psutil.net_io_counters()
+            except (PermissionError, FileNotFoundError):
+                self.start_network_stats = None
+        
         print("[INFO] Statistics reset")
     
     def http_flood(self, target_ip, target_port, bot_count, thread_count, duration):
@@ -581,6 +604,19 @@ class PyNetStressTerminal:
             packets = self.attack_stats['packets_sent']
             requests = self.attack_stats['requests_sent']
             bytes_sent = self.attack_stats['bytes_sent']
+            
+            # Calculate network usage if we can access the stats
+            if self.start_network_stats is not None:
+                try:
+                    current_stats = psutil.net_io_counters()
+                    elapsed_time = time.time() - start_time
+                    if elapsed_time > 0:
+                        bytes_sent_diff = current_stats.bytes_sent - self.start_network_stats.bytes_sent
+                        self.network_usage = bytes_sent_diff / elapsed_time / 1024  # KB/s
+                except (PermissionError, FileNotFoundError):
+                    self.start_network_stats = None
+                    self.network_usage = 0
+            
             if bytes_sent > 1024*1024*1024:
                 data_text = f"{bytes_sent/(1024*1024*1024):.2f} GB"
             elif bytes_sent > 1024*1024:
@@ -589,14 +625,29 @@ class PyNetStressTerminal:
                 data_text = f"{bytes_sent/1024:.2f} KB"
             else:
                 data_text = f"{bytes_sent} B"
+                
+            # Get CPU and memory usage
+            try:
+                self.cpu_usage = psutil.cpu_percent()
+                memory = psutil.virtual_memory()
+                self.memory_usage = memory.percent
+            except (PermissionError, FileNotFoundError):
+                self.cpu_usage = 0
+                self.memory_usage = 0
+                
             sys.stdout.write("\033[K")
-            sys.stdout.write(f"\r[STATS] Time: {int(elapsed)}s | Packets: {packets:,} | Requests: {requests:,} | Data: {data_text}")
+            if self.start_network_stats is not None:
+                sys.stdout.write(f"\r[STATS] Time: {int(elapsed)}s | Packets: {packets:,} | Requests: {requests:,} | Data: {data_text} | CPU: {self.cpu_usage:.1f}% | Mem: {self.memory_usage:.1f}% | Net: {self.network_usage:.1f} KB/s")
+            else:
+                sys.stdout.write(f"\r[STATS] Time: {int(elapsed)}s | Packets: {packets:,} | Requests: {requests:,} | Data: {data_text} | CPU: {self.cpu_usage:.1f}% | Mem: {self.memory_usage:.1f}%")
             sys.stdout.flush()
             time.sleep(1)
+            
         elapsed = time.time() - start_time
         packets = self.attack_stats['packets_sent']
         requests = self.attack_stats['requests_sent']
         bytes_sent = self.attack_stats['bytes_sent']
+        
         if bytes_sent > 1024*1024*1024:
             data_text = f"{bytes_sent/(1024*1024*1024):.2f} GB"
         elif bytes_sent > 1024*1024:
@@ -605,6 +656,7 @@ class PyNetStressTerminal:
             data_text = f"{bytes_sent/1024:.2f} KB"
         else:
             data_text = f"{bytes_sent} B"
+            
         print(f"\n[INFO] Attack completed in {int(elapsed)}s")
         print(f"[INFO] Total packets: {packets:,}")
         print(f"[INFO] Total requests: {requests:,}")
@@ -616,10 +668,16 @@ class PyNetStressTerminal:
         count = 4
         timeout = 2
         print(f"[INFO] Pinging {target} ({self.target_ip}) with {count} packets")
+        
+        # Use different ping commands based on platform
         if os.name == 'nt':
             cmd = ['ping', '-n', str(count), '-w', str(timeout*1000), self.target_ip]
+        elif IS_TERMUX:
+            # Termux-specific ping command
+            cmd = ['ping', '-c', str(count), '-W', str(timeout), self.target_ip]
         else:
             cmd = ['ping', '-c', str(count), '-W', str(timeout), self.target_ip]
+            
         try:
             result = subprocess.run(cmd, capture_output=True, text=True)
             print(result.stdout)
@@ -632,10 +690,18 @@ class PyNetStressTerminal:
         if not self.resolve_target(target):
             return False
         print(f"[INFO] Traceroute to {target} ({self.target_ip})")
+        
+        # Use different traceroute commands based on platform
         if os.name == 'nt':
             cmd = ['tracert', self.target_ip]
+        elif IS_TERMUX:
+            # Termux might not have traceroute installed by default
+            print("[WARNING] Traceroute may not be available in Termux")
+            print("Install with: pkg install traceroute")
+            return
         else:
             cmd = ['traceroute', self.target_ip]
+            
         try:
             result = subprocess.run(cmd, capture_output=True, text=True)
             print(result.stdout)
@@ -659,9 +725,11 @@ class PyNetStressTerminal:
                         open_ports.append(port)
                         print(f"[+] Port {port}: OPEN")
                     else:
-                        print(f"[-] Port {port}: closed")
+                        if DEBUG_MODE:
+                            print(f"[-] Port {port}: closed")
             except Exception as e:
-                print(f"[ERROR] Error scanning port {port}: {e}")
+                if DEBUG_MODE:
+                    print(f"[ERROR] Error scanning port {port}: {e}")
         print(f"[INFO] Open ports: {', '.join(map(str, open_ports))}")
     
     def whois_lookup(self, target):
@@ -724,7 +792,8 @@ class PyNetStressTerminal:
                 found_subdomains.append(full_domain)
                 print(f"[+] Found: {full_domain}")
             except:
-                pass
+                if DEBUG_MODE:
+                    print(f"[-] Not found: {full_domain}")
         print(f"[INFO] Found {len(found_subdomains)} subdomains")
     
     def network_scan(self, network):
@@ -741,17 +810,25 @@ class PyNetStressTerminal:
                 hostname = socket.gethostbyaddr(ip_str)[0]
             except:
                 hostname = "Unknown"
+                
+            # Use different ping commands based on platform
             if os.name == 'nt':
                 cmd = ['ping', '-n', '1', '-w', '1000', ip_str]
+            elif IS_TERMUX:
+                cmd = ['ping', '-c', '1', '-W', '1', ip_str]
             else:
                 cmd = ['ping', '-c', '1', '-W', '1', ip_str]
+                
             try:
                 result = subprocess.run(cmd, capture_output=True, text=True)
                 if result.returncode == 0:
                     live_hosts.append((ip_str, hostname))
                     print(f"[+] Live host: {ip_str} ({hostname})")
-            except:
-                pass
+                elif DEBUG_MODE:
+                    print(f"[-] Host down: {ip_str}")
+            except Exception as e:
+                if DEBUG_MODE:
+                    print(f"[ERROR] Error pinging {ip_str}: {e}")
         print(f"[INFO] Found {len(live_hosts)} live hosts in {network}")
     
     def speed_test(self):
